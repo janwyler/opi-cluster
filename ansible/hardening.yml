@@ -1,0 +1,152 @@
+---
+- name: Orange Pi Cluster Hardening
+  hosts: cluster
+  become: yes
+
+  vars:
+    ssh_port: 2222
+    admin_user: YOUR_USERNAME
+
+  vars_prompt:
+    - name: disable_password_auth
+      prompt: |
+        Passwort-Login deaktivieren?
+        (SSH-Key muss bereits funktionieren!)
+        Eingabe (yes/no)
+      default: "no"
+      private: no
+
+  tasks:
+
+    - name: System aktualisieren
+      apt:
+        update_cache: yes
+        upgrade: full
+
+    - name: Pakete installieren
+      apt:
+        name:
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+        state: present
+
+    - name: UFW - deny incoming
+      ufw:
+        default: deny
+        direction: incoming
+
+    - name: UFW - allow outgoing
+      ufw:
+        default: allow
+        direction: outgoing
+
+    - name: UFW - SSH Port freigeben
+      ufw:
+        rule: allow
+        port: "{{ ssh_port }}"
+        proto: tcp
+
+    - name: UFW - HTTP freigeben
+      ufw:
+        rule: allow
+        port: 80
+        proto: tcp
+
+    - name: UFW - HTTPS freigeben
+      ufw:
+        rule: allow
+        port: 443
+        proto: tcp
+
+    - name: UFW aktivieren
+      ufw:
+        state: enabled
+
+    - name: SSH absichern
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^#?Port',                line: 'Port {{ ssh_port }}' }
+        - { regexp: '^#?PermitRootLogin',      line: 'PermitRootLogin no' }
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?MaxAuthTries',         line: 'MaxAuthTries 3' }
+        - { regexp: '^#?X11Forwarding',        line: 'X11Forwarding no' }
+        - { regexp: '^#?LoginGraceTime',       line: 'LoginGraceTime 20' }
+      notify: SSH neu starten
+
+    - name: Passwort-Login deaktivieren (optional)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      when: disable_password_auth == 'yes'
+      notify: SSH neu starten
+
+    - name: Fail2Ban jail.local erstellen
+      copy:
+        src: /etc/fail2ban/jail.conf
+        dest: /etc/fail2ban/jail.local
+        remote_src: yes
+        force: no
+
+    - name: Fail2Ban SSH konfigurieren
+      blockinfile:
+        path: /etc/fail2ban/jail.local
+        block: |
+          [sshd]
+          enabled  = true
+          port     = {{ ssh_port }}
+          maxretry = 5
+          bantime  = 1h
+          findtime = 10m
+      notify: Fail2Ban neu starten
+
+    - name: Kernel Netzwerkschutz
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { key: 'net.ipv4.tcp_syncookies',           value: '1' }
+        - { key: 'net.ipv4.conf.all.rp_filter',       value: '1' }
+        - { key: 'net.ipv4.conf.all.accept_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.all.send_redirects',   value: '0' }
+
+    - name: Bluetooth deaktivieren
+      systemd:
+        name: bluetooth
+        enabled: no
+        state: stopped
+      ignore_errors: yes
+
+    - name: Avahi deaktivieren
+      systemd:
+        name: avahi-daemon
+        enabled: no
+        state: stopped
+      ignore_errors: yes
+
+    - name: Auto-Updates aktivieren
+      copy:
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+
+    - name: Root sperren
+      command: passwd -l root
+
+  handlers:
+    - name: SSH neu starten
+      systemd:
+        name: sshd
+        state: restarted
+
+    - name: Fail2Ban neu starten
+      systemd:
+        name: fail2ban
+        state: restarted
